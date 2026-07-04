@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+
+# DUELO runtime
+logs/
+costs.json
+
+# config.json NO se ignora: viaja con el repo

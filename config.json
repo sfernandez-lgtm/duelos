@@ -1,0 +1,47 @@
+{
+  "providers": [
+    {
+      "name": "claude",
+      "type": "cli",
+      "display_name": "Claude Opus",
+      "color": "blue",
+      "enabled": true
+    },
+    {
+      "name": "gemini",
+      "type": "api",
+      "display_name": "Gemini 3 Pro",
+      "color": "green",
+      "enabled": false,
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "api_key_env": "GEMINI_API_KEY",
+      "model": "gemini-3-pro",
+      "price_input_per_m": 2.0,
+      "price_output_per_m": 12.0
+    },
+    {
+      "name": "glm",
+      "type": "api",
+      "display_name": "GLM-5.2",
+      "color": "red",
+      "enabled": false,
+      "base_url": "https://api.z.ai/api/paas/v4",
+      "api_key_env": "GLM_API_KEY",
+      "model": "glm-5.2",
+      "price_input_per_m": 0.6,
+      "price_output_per_m": 2.2
+    },
+    {
+      "name": "kimi",
+      "type": "api",
+      "display_name": "Kimi K2.6",
+      "color": "magenta",
+      "enabled": false,
+      "base_url": "https://api.moonshot.ai/v1",
+      "api_key_env": "KIMI_API_KEY",
+      "model": "kimi-k2.6",
+      "price_input_per_m": 1.0,
+      "price_output_per_m": 3.0
+    }
+  ]
+}
