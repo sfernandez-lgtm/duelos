@@ -3,11 +3,110 @@
 
 import os
 
+from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
+from core.cleaner import clean_code, clean_filename, last_code_block
 from core.config import load_config, load_providers, save_config
+from core.session import Session
 from ui.console import console, error, info, print_banner, success, warn
+
+CODER_SYSTEM_PROMPT = (
+    "Sos un desarrollador senior en sesión de pair programming. "
+    "Respondé de forma directa y concisa. "
+    "Cuando entregues código, entregalo completo y funcional."
+)
+
+SNIPPETS_DIR = os.path.join(os.path.expanduser("~"), "ai-projects", "snippets")
+
+
+def pick_provider(providers):
+    """Elige un provider: directo si hay uno solo, con prompt si hay varios."""
+    if len(providers) == 1:
+        return providers[0]
+    console.print("[bold]Providers disponibles:[/bold]")
+    for i, p in enumerate(providers, start=1):
+        console.print("  [bold]{}[/bold] [{}]{}[/{}]".format(i, p.color, p.display_name, p.color))
+    choice = Prompt.ask("Provider", choices=[str(i) for i in range(1, len(providers) + 1)], default="1")
+    return providers[int(choice) - 1]
+
+
+def save_snippet(session: Session, raw_filename: str) -> None:
+    """Guarda el último bloque de código de la última respuesta en snippets/."""
+    last_response = next((t["content"] for t in reversed(session.turns) if t["role"] == "assistant"), None)
+    if last_response is None:
+        warn("Todavía no hay ninguna respuesta de la que guardar código")
+        return
+    block = last_code_block(last_response)
+    code = clean_code(block if block is not None else last_response)
+    if not code:
+        warn("La última respuesta no tiene código para guardar")
+        return
+    filename = clean_filename(raw_filename)
+    os.makedirs(SNIPPETS_DIR, exist_ok=True)
+    path = os.path.join(SNIPPETS_DIR, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(code)
+        if not code.endswith("\n"):
+            f.write("\n")
+    success("Código guardado en {}".format(path))
+
+
+def coder_mode(config) -> None:
+    """Sesión de chat de pair programming con un provider."""
+    providers, warnings = load_providers(config)
+    for message in warnings:
+        warn(message)
+    if not providers:
+        warn("No hay providers habilitados; activá alguno en 🤖 Modelos")
+        return
+
+    provider = pick_provider(providers)
+    session = Session(provider.name)
+    info("Modo Coder con [{}]{}[/{}] — comandos: /salir, /limpiar, /guardar <archivo>".format(
+        provider.color, provider.display_name, provider.color
+    ))
+
+    while True:
+        console.print()
+        user_input = Prompt.ask("[bold green]vos[/bold green]").strip()
+        if not user_input:
+            continue
+
+        if user_input == "/salir":
+            if session.turns:
+                path = session.save_log()
+                success("Sesión guardada en {}".format(path))
+            return
+        if user_input == "/limpiar":
+            session.clear()
+            success("Historial reseteado")
+            continue
+        if user_input.startswith("/guardar"):
+            raw_filename = user_input[len("/guardar"):].strip()
+            if not raw_filename:
+                warn("Uso: /guardar <filename>")
+            else:
+                save_snippet(session, raw_filename)
+            continue
+
+        prompt = session.build_prompt(user_input)
+        with console.status("[{}]{} pensando...[/{}]".format(provider.color, provider.display_name, provider.color)):
+            response = provider.generate(prompt, CODER_SYSTEM_PROMPT)
+
+        if not response.ok:
+            error("{}: {}".format(provider.display_name, response.error))
+            continue
+
+        session.add_turn("user", user_input)
+        session.add_turn("assistant", response.text)
+        console.print(Panel(
+            response.text,
+            title="[{}]{}[/{}]".format(provider.color, provider.display_name, provider.color),
+            subtitle="{:.1f}s".format(response.elapsed_seconds),
+            border_style=provider.color,
+        ))
 
 
 def show_models(config) -> None:
@@ -95,14 +194,17 @@ def main() -> None:
 
     while True:
         console.print()
-        console.print("[bold]1[/bold] 🤖 Modelos")
-        console.print("[bold]2[/bold] 🩺 Test de conectividad")
-        console.print("[bold]3[/bold] 🚪 Salir")
-        choice = Prompt.ask("Opción", choices=["1", "2", "3"], default="3")
+        console.print("[bold]1[/bold] 💻 Coder")
+        console.print("[bold]2[/bold] 🤖 Modelos")
+        console.print("[bold]3[/bold] 🩺 Test de conectividad")
+        console.print("[bold]4[/bold] 🚪 Salir")
+        choice = Prompt.ask("Opción", choices=["1", "2", "3", "4"], default="4")
 
         if choice == "1":
-            show_models(config)
+            coder_mode(config)
         elif choice == "2":
+            show_models(config)
+        elif choice == "3":
             run_health_checks(config)
         else:
             info("¡Hasta el próximo duelo!")
