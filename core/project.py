@@ -237,6 +237,16 @@ def run_project(provider: AIProvider, providers: List[AIProvider],
     if Prompt.ask("¿Generar el proyecto?", choices=["s", "n"], default="s") != "s":
         info("Generación cancelada")
         return
+
+    n = len(providers)
+    files_count = len(plan["files"])
+    pro_calls = files_count * (n + n * (n - 1) + 1)
+    info(
+        "Llamadas estimadas — rápido: {} · pro con {} provider(s): {} "
+        "(por archivo: {} generaciones + {} reviews + 1 merge)".format(
+            files_count, n, pro_calls, n, n * (n - 1)
+        )
+    )
     pro_mode = Prompt.ask("Modo: (r)ápido o (p)ro?", choices=["r", "p"], default="r") == "p"
     config["last_project_mode"] = "pro" if pro_mode else "rápido"
     save_config(config)

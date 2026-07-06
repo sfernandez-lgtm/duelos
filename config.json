@@ -22,14 +22,15 @@
     {
       "name": "glm",
       "type": "openai_compat",
-      "display_name": "GLM-5.2",
+      "display_name": "GLM",
       "color": "red",
-      "enabled": false,
+      "enabled": true,
       "base_url": "https://api.z.ai/api/paas/v4",
       "api_key_env": "GLM_API_KEY",
       "model": "glm-5.2",
-      "price_input_per_m": 0.6,
-      "price_output_per_m": 2.2
+      "price_input_per_m": 1.4,
+      "price_output_per_m": 4.4,
+      "max_output_tokens": 4000
     },
     {
       "name": "kimi",
@@ -44,6 +45,6 @@
       "price_output_per_m": 3.0
     }
   ],
-  "last_merger": "claude",
+  "last_merger": "glm",
   "last_project_mode": "pro"
 }

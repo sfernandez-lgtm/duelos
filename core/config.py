@@ -34,14 +34,15 @@ DEFAULT_CONFIG = {
         {
             "name": "glm",
             "type": "openai_compat",
-            "display_name": "GLM-5.2",
+            "display_name": "GLM",
             "color": "red",
-            "enabled": False,
+            "enabled": True,
             "base_url": "https://api.z.ai/api/paas/v4",
             "api_key_env": "GLM_API_KEY",
             "model": "glm-5.2",
-            "price_input_per_m": 0.6,
-            "price_output_per_m": 2.2,
+            "price_input_per_m": 1.4,
+            "price_output_per_m": 4.4,
+            "max_output_tokens": 4000,
         },
         {
             "name": "kimi",
@@ -117,6 +118,7 @@ def load_providers(config: Dict[str, Any]) -> Tuple[List[AIProvider], List[str]]
                         "input_per_1m": entry.get("price_input_per_m", 0.0),
                         "output_per_1m": entry.get("price_output_per_m", 0.0),
                     },
+                    max_output_tokens=entry.get("max_output_tokens"),
                 )
             )
         elif ptype == "api":

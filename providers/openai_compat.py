@@ -23,7 +23,8 @@ class OpenAICompatProvider(AIProvider):
 
     def __init__(self, name: str, base_url: str, api_key_env: str, model: str,
                  display_name: Optional[str] = None, color: Optional[str] = None,
-                 pricing: Optional[Dict[str, float]] = None):
+                 pricing: Optional[Dict[str, float]] = None,
+                 max_output_tokens: Optional[int] = None):
         self.name = name
         self.base_url = base_url.rstrip("/")
         self.api_key_env = api_key_env
@@ -32,6 +33,9 @@ class OpenAICompatProvider(AIProvider):
         self.color = color or "white"
         # pricing: {'input_per_1m': float, 'output_per_1m': float} en USD
         self.pricing = pricing or {}
+        # max_tokens del request; None = no enviar. Los modelos razonadores
+        # (ej. GLM-5.2) devuelven content vacío si el límite es bajo: usar >= 4000.
+        self.max_output_tokens = max_output_tokens
 
     def generate(self, prompt: str, system_prompt: Optional[str] = None) -> ProviderResponse:
         """Genera una respuesta vía POST {base_url}/chat/completions."""
@@ -43,7 +47,10 @@ class OpenAICompatProvider(AIProvider):
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
-        body = json.dumps({"model": self.model, "messages": messages}).encode("utf-8")
+        payload: Dict[str, Any] = {"model": self.model, "messages": messages}
+        if self.max_output_tokens is not None:
+            payload["max_tokens"] = self.max_output_tokens
+        body = json.dumps(payload).encode("utf-8")
 
         request = urllib.request.Request(
             self.base_url + "/chat/completions",
@@ -91,9 +98,15 @@ class OpenAICompatProvider(AIProvider):
             detail = api_error.get("message") or raw[:MAX_ERROR_DETAIL]
             return self._error_response(prompt, elapsed, "respuesta sin choices: {}".format(detail))
 
-        text = ((choices[0].get("message") or {}).get("content") or "").strip()
+        message = choices[0].get("message") or {}
+        # Los modelos razonadores separan el razonamiento en reasoning_content;
+        # solo usamos el content final.
+        text = (message.get("content") or "").strip()
         if not text:
-            return self._error_response(prompt, elapsed, "respuesta con contenido vacío")
+            detail = "respuesta con contenido vacío"
+            if (message.get("reasoning_content") or "").strip():
+                detail += " (vino solo reasoning_content: subí max_output_tokens en config.json)"
+            return self._error_response(prompt, elapsed, detail)
 
         usage = data.get("usage") or {}
         prompt_tokens = usage.get("prompt_tokens")
