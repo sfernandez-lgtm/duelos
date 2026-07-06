@@ -48,5 +48,6 @@
   "last_merger": "gemini",
   "last_project_mode": "pro",
   "max_parallel": 6,
-  "director": "claude"
+  "director": "claude",
+  "max_fix_iterations": 2
 }

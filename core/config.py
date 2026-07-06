@@ -13,6 +13,7 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 DEFAULT_CONFIG = {
     "max_parallel": 6,
     "director": "claude",
+    "max_fix_iterations": 2,
     "providers": [
         {
             "name": "claude",

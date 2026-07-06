@@ -6,8 +6,6 @@ acumulando contexto entre fases. El loop de evaluación/corrección llega en 6.2
 """
 
 import json
-import subprocess
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -18,6 +16,7 @@ from rich.table import Table
 
 from core.cleaner import clean_code
 from core.costs import get_tracker
+from core.evaluator import evaluate_phase, run_phase_tests
 from core.pipeline import run_pipeline
 from core.project import (
     GEN_SYSTEM_PROMPT,
@@ -31,8 +30,6 @@ from core.project import (
 from core.validator import validate_file
 from providers.base import AIProvider
 from ui.console import console, error, info, success, warn
-
-TESTS_TIMEOUT_SECONDS = 120
 
 DIRECTOR_SYSTEM_PROMPT = (
     "Sos el director técnico de un equipo de IAs de código. Respondés únicamente "
@@ -276,35 +273,18 @@ def _generate_phase_file(director: AIProvider, providers: List[AIProvider],
     return target, ""
 
 
-def _run_phase_tests(project_dir: Path, test_files: List[str]) -> Dict[str, Any]:
-    """Corre los tests de la fase (pytest si está disponible, si no unittest)."""
-    has_pytest = subprocess.run(
-        [sys.executable, "-c", "import pytest"], capture_output=True
-    ).returncode == 0
-    if has_pytest:
-        command = [sys.executable, "-m", "pytest", "-q"] + test_files
-    else:
-        modules = [f[:-3].replace("/", ".") for f in test_files]
-        command = [sys.executable, "-m", "unittest"] + modules
-
-    try:
-        result = subprocess.run(
-            command, cwd=str(project_dir), capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=TESTS_TIMEOUT_SECONDS,
-        )
-        output = (result.stdout + "\n" + result.stderr).strip()
-        summary = "\n".join(output.splitlines()[-5:])
-        returncode = result.returncode
-    except subprocess.TimeoutExpired:
-        summary, returncode = "timeout tras {}s".format(TESTS_TIMEOUT_SECONDS), -1
-    except OSError as exc:
-        summary, returncode = "no se pudieron correr: {}".format(exc), -1
-
-    if returncode == 0:
-        success("Tests de la fase OK ({})".format(" ".join(command[2:])))
-    else:
-        warn("Tests de la fase FALLARON (exit {}) — en 6.1 solo se registra:\n{}".format(returncode, summary))
-    return {"command": " ".join(command), "returncode": returncode, "summary": summary}
+def _fix_feedback(attempt: int, feedback: str, rel_path: str, previous: str) -> str:
+    """Bloque de corrección que se suma al prompt base del archivo."""
+    body = previous
+    if len(body) > MAX_CONTEXT_CHARS_PER_FILE:
+        body = body[:MAX_CONTEXT_CHARS_PER_FILE] + "\n... [truncado]"
+    return (
+        "\n\nCORRECCIÓN REQUERIDA (intento {}): la versión anterior de la fase NO pasó la "
+        "evaluación.\nProblemas concretos detectados:\n{}\n\n"
+        "Versión anterior de '{}':\n{}\n\n"
+        "Generá la versión corregida COMPLETA del archivo, arreglando esos problemas "
+        "sin romper lo que ya funcionaba.".format(attempt, feedback, rel_path, body or "(no se generó)")
+    )
 
 
 def _tracker_totals() -> Tuple[int, float]:
@@ -332,6 +312,106 @@ def get_director(config: Dict[str, Any], providers: List[AIProvider]) -> Optiona
     ))
     info("Configurá 'director' en config.json con un provider enabled")
     return None
+
+
+def _generate_files(director: AIProvider, providers: List[AIProvider], config: Dict[str, Any],
+                    roadmap: Dict[str, Any], phase: Dict[str, Any], generated: Dict[str, str],
+                    project_dir: Path, mode: str, targets: List[str],
+                    phase_files: Dict[str, Dict[str, Any]],
+                    feedback: str = "", attempt: int = 0) -> None:
+    """Genera (o regenera con feedback) los archivos `targets` de la fase.
+
+    Actualiza in place `generated` (contexto acumulado) y `phase_files` (estado por archivo).
+    """
+    purposes = {f["path"]: f["purpose"] for f in phase["files"]}
+    for rel_path in targets:
+        label = "[fase {} · {}] ".format(phase["number"], rel_path)
+        prompt = _phase_file_prompt(roadmap, phase, list(generated.items()), rel_path, purposes.get(rel_path, ""))
+        if feedback:
+            prompt += _fix_feedback(attempt, feedback, rel_path, generated.get(rel_path, ""))
+        target, fail_reason = _generate_phase_file(
+            director, providers, config, project_dir, prompt, rel_path, mode, label
+        )
+        if target is None:
+            error("{}: {}".format(rel_path, fail_reason))
+            phase_files[rel_path] = {"path": rel_path, "valid": False, "reason": fail_reason}
+            continue
+        content = target.read_text(encoding="utf-8")
+        generated[rel_path] = content
+        phase_files[rel_path] = {"path": rel_path, "valid": True, "bytes": target.stat().st_size}
+        success("{} escrito ({:,} B)".format(rel_path, target.stat().st_size))
+
+
+def _execute_phase(director: AIProvider, providers: List[AIProvider], config: Dict[str, Any],
+                   roadmap: Dict[str, Any], phase: Dict[str, Any], generated: Dict[str, str],
+                   project_dir: Path, mode: str, max_fix: int) -> Dict[str, Any]:
+    """Corre una fase completa: generación + evaluación + loop de corrección.
+
+    Con max_fix <= 0 se comporta como 6.1: corre los tests, solo muestra y registra.
+    Devuelve la entrada de la fase para phase_log.json.
+    """
+    calls_before, cost_before = _tracker_totals()
+    phase_paths = [f["path"] for f in phase["files"]]
+    phase_files: Dict[str, Dict[str, Any]] = {}
+
+    _generate_files(director, providers, config, roadmap, phase, generated,
+                    project_dir, mode, phase_paths, phase_files)
+
+    attempts: List[Dict[str, Any]] = []
+    tests_last: Optional[Dict[str, Any]] = None
+    final_verdict: Optional[str] = None
+
+    if max_fix <= 0:
+        # comportamiento 6.1: mostrar y registrar, sin evaluador ni correcciones
+        test_files = [p for p in phase_paths if Path(p).name.startswith("test_")
+                      and p.endswith(".py") and p in generated]
+        tests_last = run_phase_tests(project_dir, test_files) if test_files else None
+    else:
+        for attempt in range(1, max_fix + 2):
+            evaluation = evaluate_phase(director, project_dir, phase, phase_paths)
+            if evaluation.tests is not None:
+                tests_last = evaluation.tests
+            attempts.append({
+                "attempt": attempt,
+                "level": evaluation.level,
+                "passed": evaluation.passed,
+                "feedback": evaluation.feedback[:1500],
+                "tests": {k: v for k, v in (evaluation.tests or {}).items() if k != "output"} or None,
+                "judgment": evaluation.judgment,
+            })
+            if evaluation.passed:
+                final_verdict = "pass"
+                success("Fase {} en verde (intento {})".format(phase["number"], attempt))
+                break
+            if attempt == max_fix + 1:
+                final_verdict = "fail"
+                error("Fase {} sigue en fail tras {} corrección(es)".format(phase["number"], max_fix))
+                break
+
+            resumen = evaluation.feedback.strip().splitlines()[0][:70] if evaluation.feedback else "evaluación en fail"
+            console.rule("[bold yellow]FASE {} · corrección {}/{}: {}[/bold yellow]".format(
+                phase["number"], attempt, max_fix, resumen
+            ))
+            targets = [p for p in phase_paths if p in evaluation.files_to_fix] or phase_paths
+            attempts[-1]["files_fixed"] = targets
+            _generate_files(director, providers, config, roadmap, phase, generated,
+                            project_dir, mode, targets, phase_files,
+                            feedback=evaluation.feedback, attempt=attempt)
+
+    calls_after, cost_after = _tracker_totals()
+    tests_log = {k: v for k, v in (tests_last or {}).items() if k != "output"} or None
+    return {
+        "number": phase["number"],
+        "title": phase["title"],
+        "mode": mode,
+        "files": list(phase_files.values()),
+        "tests": tests_log,
+        "attempts": attempts,
+        "final_verdict": final_verdict,
+        "calls": calls_after - calls_before,
+        "cost_usd": round(cost_after - cost_before, 6),
+        "completed_at": datetime.now().isoformat(timespec="seconds"),
+    }
 
 
 def run_director(providers: List[AIProvider], config: Dict[str, Any], request: str) -> None:
@@ -365,9 +445,13 @@ def run_director(providers: List[AIProvider], config: Dict[str, Any], request: s
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "phases": [],
     }
-    generated: List[Tuple[str, str]] = []
+    generated: Dict[str, str] = {}
     total_phases = len(roadmap["phases"])
     completed = 0
+    try:
+        max_fix = max(0, int(config.get("max_fix_iterations", 2)))
+    except (TypeError, ValueError):
+        max_fix = 2
 
     try:
         for phase in roadmap["phases"]:
@@ -382,43 +466,23 @@ def run_director(providers: List[AIProvider], config: Dict[str, Any], request: s
             for criterion in phase["acceptance_criteria"]:
                 console.print("  [dim]· {}[/dim]".format(criterion))
 
-            phase_calls_before, phase_cost_before = _tracker_totals()
-            phase_files: List[Dict[str, Any]] = []
-            new_test_files: List[str] = []
-
-            for entry in phase["files"]:
-                rel_path, purpose = entry["path"], entry["purpose"]
-                label = "[fase {} · {}] ".format(i, rel_path)
-                prompt = _phase_file_prompt(roadmap, phase, generated, rel_path, purpose)
-                target, fail_reason = _generate_phase_file(
-                    director, providers, config, project_dir, prompt, rel_path, mode, label
-                )
-                if target is None:
-                    error("{}: {}".format(rel_path, fail_reason))
-                    phase_files.append({"path": rel_path, "valid": False, "reason": fail_reason})
-                    continue
-                content = target.read_text(encoding="utf-8")
-                generated.append((rel_path, content))
-                phase_files.append({"path": rel_path, "valid": True, "bytes": target.stat().st_size})
-                success("{} escrito ({:,} B)".format(rel_path, target.stat().st_size))
-                if Path(rel_path).name.startswith("test_") and rel_path.endswith(".py"):
-                    new_test_files.append(rel_path)
-
-            tests_result = _run_phase_tests(project_dir, new_test_files) if new_test_files else None
-
-            phase_calls_after, phase_cost_after = _tracker_totals()
-            log["phases"].append({
-                "number": i,
-                "title": phase["title"],
-                "mode": mode,
-                "files": phase_files,
-                "tests": tests_result,
-                "calls": phase_calls_after - phase_calls_before,
-                "cost_usd": round(phase_cost_after - phase_cost_before, 6),
-                "completed_at": datetime.now().isoformat(timespec="seconds"),
-            })
+            entry = _execute_phase(director, providers, config, roadmap, phase,
+                                   generated, project_dir, mode, max_fix)
+            log["phases"].append(entry)
             _write_log(project_dir, log)
             completed += 1
+
+            if entry["final_verdict"] == "fail":
+                if auto:
+                    error("Fase {} en fail en modo auto: se aborta con checkpoint (no se arrastran fases rotas)".format(i))
+                    break
+                choice = Prompt.ask(
+                    "Fase {} en fail: (c)ontinuar igual / (a)bortar con checkpoint".format(i),
+                    choices=["c", "a"], default="a",
+                )
+                if choice == "a":
+                    warn("Checkpoint: {} de {} fases en {}".format(completed, total_phases, project_dir))
+                    break
 
             if not auto and i < total_phases:
                 if Prompt.ask("¿Continuar con fase {}?".format(i + 1), choices=["s", "n"], default="s") != "s":
@@ -442,6 +506,8 @@ def _show_final_summary(project_dir: Path, log: Dict[str, Any], completed: int,
     table.add_column("Título")
     table.add_column("Archivos")
     table.add_column("Tests")
+    table.add_column("Intentos", justify="right")
+    table.add_column("Veredicto")
     for entry in log["phases"]:
         ok_files = sum(1 for f in entry["files"] if f.get("valid"))
         tests = entry.get("tests")
@@ -451,9 +517,18 @@ def _show_final_summary(project_dir: Path, log: Dict[str, Any], completed: int,
             tests_cell = "[green]✔ OK[/green]"
         else:
             tests_cell = "[red]✖ exit {}[/red]".format(tests["returncode"])
+        attempts = entry.get("attempts") or []
+        verdict = entry.get("final_verdict")
+        if verdict == "pass":
+            verdict_cell = "[green]✔ pass[/green]"
+        elif verdict == "fail":
+            verdict_cell = "[red]✖ fail[/red]"
+        else:
+            verdict_cell = "[dim]—[/dim]"
         table.add_row(
             str(entry["number"]), entry["title"],
             "{}/{}".format(ok_files, len(entry["files"])), tests_cell,
+            str(len(attempts)) if attempts else "[dim]—[/dim]", verdict_cell,
         )
     console.print(table)
 
