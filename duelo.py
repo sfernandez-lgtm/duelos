@@ -9,6 +9,7 @@ from rich.table import Table
 
 from core.cleaner import clean_code, clean_filename, last_code_block
 from core.config import load_config, load_providers, save_config
+from core.costs import get_tracker, load_history
 from core.session import Session
 from ui.console import console, error, info, print_banner, success, warn
 
@@ -64,7 +65,8 @@ def coder_mode(config) -> None:
 
     provider = pick_provider(providers)
     session = Session(provider.name)
-    info("Modo Coder con [{}]{}[/{}] — comandos: /salir, /limpiar, /guardar <archivo>".format(
+    tracker = get_tracker()
+    info("Modo Coder con [{}]{}[/{}] — comandos: /salir, /limpiar, /guardar <archivo>, /costos".format(
         provider.color, provider.display_name, provider.color
     ))
 
@@ -78,10 +80,16 @@ def coder_mode(config) -> None:
             if session.turns:
                 path = session.save_log()
                 success("Sesión guardada en {}".format(path))
+            if tracker.has_data:
+                tracker.render_summary(console)
+                tracker.save()
             return
         if user_input == "/limpiar":
             session.clear()
             success("Historial reseteado")
+            continue
+        if user_input == "/costos":
+            tracker.render_summary(console)
             continue
         if user_input.startswith("/guardar"):
             raw_filename = user_input[len("/guardar"):].strip()
@@ -94,6 +102,7 @@ def coder_mode(config) -> None:
         prompt = session.build_prompt(user_input)
         with console.status("[{}]{} pensando...[/{}]".format(provider.color, provider.display_name, provider.color)):
             response = provider.generate(prompt, CODER_SYSTEM_PROMPT)
+        tracker.record(provider.name, response, "coder")
 
         if not response.ok:
             error("{}: {}".format(provider.display_name, response.error))
@@ -168,9 +177,11 @@ def run_health_checks(config) -> None:
     table.add_column("Tiempo", justify="right")
     table.add_column("Resultado")
 
+    tracker = get_tracker()
     for provider in providers:
         info("Testeando {}...".format(provider.display_name))
         response = provider.health_check()
+        tracker.record(provider.name, response, "health_check")
         if response.ok:
             result = "[green]✔ OK[/green]"
             text = response.text or "[dim](vacío)[/dim]"
@@ -187,6 +198,31 @@ def run_health_checks(config) -> None:
     console.print(table)
 
 
+def show_costs() -> None:
+    """Resumen de costos de la sesión actual + histórico de costs.json."""
+    tracker = get_tracker()
+    tracker.render_summary(console)
+
+    history = load_history()
+    if not history:
+        info("Sin histórico de sesiones todavía (costs.json vacío)")
+        return
+
+    table = Table(title="📜 Histórico de sesiones (últimas 10)", header_style="bold")
+    table.add_column("Fecha")
+    table.add_column("Llamadas", justify="right")
+    table.add_column("Costo total USD", justify="right")
+
+    for entry in history[-10:]:
+        calls = sum(p.get("calls", 0) for p in entry.get("providers", {}).values())
+        table.add_row(
+            entry.get("session_start", "?").replace("T", " "),
+            str(calls),
+            "${:.4f}".format(entry.get("total_cost_usd", 0.0)),
+        )
+    console.print(table)
+
+
 def main() -> None:
     """Loop del menú principal."""
     print_banner()
@@ -195,18 +231,24 @@ def main() -> None:
     while True:
         console.print()
         console.print("[bold]1[/bold] 💻 Coder")
-        console.print("[bold]2[/bold] 🤖 Modelos")
-        console.print("[bold]3[/bold] 🩺 Test de conectividad")
-        console.print("[bold]4[/bold] 🚪 Salir")
-        choice = Prompt.ask("Opción", choices=["1", "2", "3", "4"], default="4")
+        console.print("[bold]2[/bold] 💰 Costos")
+        console.print("[bold]3[/bold] 🤖 Modelos")
+        console.print("[bold]4[/bold] 🩺 Test de conectividad")
+        console.print("[bold]5[/bold] 🚪 Salir")
+        choice = Prompt.ask("Opción", choices=["1", "2", "3", "4", "5"], default="5")
 
         if choice == "1":
             coder_mode(config)
         elif choice == "2":
-            show_models(config)
+            show_costs()
         elif choice == "3":
+            show_models(config)
+        elif choice == "4":
             run_health_checks(config)
         else:
+            tracker = get_tracker()
+            if tracker.has_data:
+                tracker.save()
             info("¡Hasta el próximo duelo!")
             return
 
