@@ -13,6 +13,7 @@ import shutil
 from core.cleaner import clean_code, clean_filename, last_code_block
 from core.config import CONFIG_PATH, load_config, load_providers, save_config
 from core.costs import get_tracker, load_history
+from core.director import run_director
 from core.env import ENV_PATH, load_env
 from core.pipeline import run_pipeline
 from core.project import run_project
@@ -225,6 +226,34 @@ def project_mode(config) -> None:
     run_project(provider, providers, config, description)
 
 
+def _read_multiline(header: str):
+    """Lee texto multilínea hasta línea vacía o /fin."""
+    info(header)
+    lines = []
+    while True:
+        line = console.input("[bold green]> [/bold green]")
+        if not line.strip() or line.strip() == "/fin":
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def director_mode(config) -> None:
+    """Pide el pedido grande y corre el flujo del Director (core/director.py)."""
+    providers, warnings = load_providers(config)
+    for message in warnings:
+        warn(message)
+    if not providers:
+        warn("No hay providers habilitados; activá alguno en 🤖 Modelos")
+        return
+
+    request = _read_multiline("Describí el pedido grande a dirigir (terminá con una línea vacía o /fin)")
+    if not request:
+        warn("Pedido vacío; volviendo al menú")
+        return
+    run_director(providers, config, request)
+
+
 def show_models(config) -> None:
     """Lista los providers configurados y permite togglear enabled."""
     while True:
@@ -360,11 +389,12 @@ def main() -> None:
         console.print(status_line)
         console.print("[bold]1[/bold] 💻 Coder")
         console.print("[bold]2[/bold] 📦 Proyecto")
-        console.print("[bold]3[/bold] 💰 Costos")
-        console.print("[bold]4[/bold] 🤖 Modelos")
-        console.print("[bold]5[/bold] 🩺 Test de conectividad")
-        console.print("[bold]6[/bold] 🚪 Salir")
-        choice = Prompt.ask("Opción", choices=["1", "2", "3", "4", "5", "6"], default="6")
+        console.print("[bold]3[/bold] 🎬 Director")
+        console.print("[bold]4[/bold] 💰 Costos")
+        console.print("[bold]5[/bold] 🤖 Modelos")
+        console.print("[bold]6[/bold] 🩺 Test de conectividad")
+        console.print("[bold]7[/bold] 🚪 Salir")
+        choice = Prompt.ask("Opción", choices=["1", "2", "3", "4", "5", "6", "7"], default="7")
 
         try:
             if choice == "1":
@@ -372,10 +402,12 @@ def main() -> None:
             elif choice == "2":
                 project_mode(config)
             elif choice == "3":
-                show_costs()
+                director_mode(config)
             elif choice == "4":
-                show_models(config)
+                show_costs()
             elif choice == "5":
+                show_models(config)
+            elif choice == "6":
                 run_health_checks(config)
             else:
                 _save_tracker_if_needed()
