@@ -10,6 +10,7 @@ from rich.table import Table
 from core.cleaner import clean_code, clean_filename, last_code_block
 from core.config import load_config, load_providers, save_config
 from core.costs import get_tracker, load_history
+from core.project import run_project
 from core.session import Session
 from ui.console import console, error, info, print_banner, success, warn
 
@@ -116,6 +117,31 @@ def coder_mode(config) -> None:
             subtitle="{:.1f}s".format(response.elapsed_seconds),
             border_style=provider.color,
         ))
+
+
+def project_mode(config) -> None:
+    """Pide la descripción del proyecto y corre el pipeline de core/project.py."""
+    providers, warnings = load_providers(config)
+    for message in warnings:
+        warn(message)
+    if not providers:
+        warn("No hay providers habilitados; activá alguno en 🤖 Modelos")
+        return
+
+    provider = pick_provider(providers)
+    info("Describí el proyecto a generar (terminá con una línea vacía o /fin)")
+    lines = []
+    while True:
+        line = console.input("[bold green]> [/bold green]")
+        if not line.strip() or line.strip() == "/fin":
+            break
+        lines.append(line)
+
+    description = "\n".join(lines).strip()
+    if not description:
+        warn("Descripción vacía; volviendo al menú")
+        return
+    run_project(provider, description)
 
 
 def show_models(config) -> None:
@@ -231,19 +257,22 @@ def main() -> None:
     while True:
         console.print()
         console.print("[bold]1[/bold] 💻 Coder")
-        console.print("[bold]2[/bold] 💰 Costos")
-        console.print("[bold]3[/bold] 🤖 Modelos")
-        console.print("[bold]4[/bold] 🩺 Test de conectividad")
-        console.print("[bold]5[/bold] 🚪 Salir")
-        choice = Prompt.ask("Opción", choices=["1", "2", "3", "4", "5"], default="5")
+        console.print("[bold]2[/bold] 📦 Proyecto")
+        console.print("[bold]3[/bold] 💰 Costos")
+        console.print("[bold]4[/bold] 🤖 Modelos")
+        console.print("[bold]5[/bold] 🩺 Test de conectividad")
+        console.print("[bold]6[/bold] 🚪 Salir")
+        choice = Prompt.ask("Opción", choices=["1", "2", "3", "4", "5", "6"], default="6")
 
         if choice == "1":
             coder_mode(config)
         elif choice == "2":
-            show_costs()
+            project_mode(config)
         elif choice == "3":
-            show_models(config)
+            show_costs()
         elif choice == "4":
+            show_models(config)
+        elif choice == "5":
             run_health_checks(config)
         else:
             tracker = get_tracker()

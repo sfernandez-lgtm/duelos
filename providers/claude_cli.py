@@ -1,5 +1,6 @@
 """Provider que invoca el CLI de Claude (siempre modelo Opus)."""
 
+import shutil
 import subprocess
 import time
 from typing import Optional
@@ -30,20 +31,31 @@ class ClaudeCLIProvider(AIProvider):
         if system_prompt:
             full_prompt = "[INSTRUCCIONES DE SISTEMA]\n" + system_prompt + SYSTEM_SEPARATOR + prompt
 
+        # shutil.which resuelve también claude.cmd (shim de npm en Windows),
+        # que subprocess no encuentra por nombre pelado.
+        cli_path = shutil.which("claude")
+        if cli_path is None:
+            return self._error_response(full_prompt, 0.0, "CLI 'claude' no encontrado en PATH")
+
         start = time.monotonic()
         try:
+            # El prompt va por stdin: evita el límite de longitud de la línea
+            # de comandos de Windows y el mangling de argumentos del shim .cmd.
             result = subprocess.run(
-                ["claude", "--model", "opus", "-p", full_prompt],
+                [cli_path, "--model", "opus", "-p"],
+                input=full_prompt,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired:
             elapsed = time.monotonic() - start
             return self._error_response(full_prompt, elapsed, "timeout tras {}s".format(TIMEOUT_SECONDS))
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError) as exc:
             elapsed = time.monotonic() - start
-            return self._error_response(full_prompt, elapsed, "CLI 'claude' no encontrado en PATH")
+            return self._error_response(full_prompt, elapsed, "no se pudo ejecutar el CLI: {}".format(exc))
 
         elapsed = time.monotonic() - start
         text = result.stdout.strip()
