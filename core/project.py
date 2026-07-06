@@ -11,6 +11,7 @@ from rich.table import Table
 
 from core.cleaner import clean_code
 from core.costs import get_tracker
+from core.pipeline import run_pipeline
 from providers.base import AIProvider
 from ui.console import console, error, info, success, warn
 
@@ -212,8 +213,13 @@ def _default_readme(plan: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def run_project(provider: AIProvider, description: str) -> None:
-    """Pipeline completo del modo Proyecto: plan -> confirmación -> generación -> resumen."""
+def run_project(provider: AIProvider, providers: List[AIProvider],
+                config: Dict[str, Any], description: str) -> None:
+    """Pipeline completo del modo Proyecto: plan -> confirmación -> generación -> resumen.
+
+    provider es el principal (planifica y genera en modo rápido); providers es la
+    lista completa habilitada, usada por el pipeline PRO (generate/review/merge).
+    """
     tracker = get_tracker()
 
     plan = _make_plan(provider, description)
@@ -224,6 +230,7 @@ def run_project(provider: AIProvider, description: str) -> None:
     if Prompt.ask("¿Generar el proyecto?", choices=["s", "n"], default="s") != "s":
         info("Generación cancelada")
         return
+    pro_mode = Prompt.ask("Modo: (r)ápido o (p)ro?", choices=["r", "p"], default="r") == "p"
 
     project_dir = _unique_project_dir(plan["project_name"])
     total = len(plan["files"])
@@ -233,20 +240,28 @@ def run_project(provider: AIProvider, description: str) -> None:
 
     for i, entry in enumerate(plan["files"], start=1):
         rel_path, purpose = entry["path"], entry["purpose"]
-        status_msg = "[{}]Generando archivo {}/{}: {}[/{}]".format(
-            provider.color, i, total, rel_path, provider.color
-        )
         prompt = _file_prompt(description, plan, generated, rel_path, purpose)
-        with console.status(status_msg):
-            response = provider.generate(prompt, GEN_SYSTEM_PROMPT)
-        tracker.record(provider.name, response, "generate")
 
-        if not response.ok:
-            error("{}: {}".format(rel_path, response.error))
-            failed.append((rel_path, response.error or "error desconocido"))
-            continue
+        if pro_mode:
+            label = "[archivo {}/{}: {}] ".format(i, total, rel_path)
+            raw = run_pipeline(providers, config, prompt, GEN_SYSTEM_PROMPT, label)
+            if raw is None:
+                failed.append((rel_path, "pipeline PRO falló"))
+                continue
+        else:
+            status_msg = "[{}]Generando archivo {}/{}: {}[/{}]".format(
+                provider.color, i, total, rel_path, provider.color
+            )
+            with console.status(status_msg):
+                response = provider.generate(prompt, GEN_SYSTEM_PROMPT)
+            tracker.record(provider.name, response, "generate")
+            if not response.ok:
+                error("{}: {}".format(rel_path, response.error))
+                failed.append((rel_path, response.error or "error desconocido"))
+                continue
+            raw = response.text
 
-        content = clean_code(response.text)  # regla sagrada: todo pasa por el cleaner
+        content = clean_code(raw)  # regla sagrada: todo pasa por el cleaner
         if not content:
             warn("{}: respuesta vacía".format(rel_path))
             failed.append((rel_path, "respuesta vacía"))

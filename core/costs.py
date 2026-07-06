@@ -54,6 +54,7 @@ class CostTracker:
             "cost_usd": 0.0,
             "elapsed_seconds": 0.0,
         }
+        total_operations: Dict[str, int] = {}
         for name, stats in self.providers.items():
             rows.append({
                 "provider": name,
@@ -62,12 +63,16 @@ class CostTracker:
                 "output_tokens": stats["output_tokens"],
                 "cost_usd": stats["cost_usd"],
                 "elapsed_seconds": stats["elapsed_seconds"],
+                "operations": dict(stats["operations"]),
             })
+            for op, count in stats["operations"].items():
+                total_operations[op] = total_operations.get(op, 0) + count
             total["calls"] += stats["calls"]
             total["input_tokens"] += stats["input_tokens"]
             total["output_tokens"] += stats["output_tokens"]
             total["cost_usd"] += stats["cost_usd"]
             total["elapsed_seconds"] += stats["elapsed_seconds"]
+        total["operations"] = total_operations
         return {"rows": rows, "total": total}
 
     def render_summary(self, console) -> None:
@@ -84,6 +89,7 @@ class CostTracker:
         table = Table(title="💰 Consumo de la sesión", header_style="bold")
         table.add_column("Provider")
         table.add_column("Llamadas", justify="right")
+        table.add_column("Operaciones")
         table.add_column("Tokens in", justify="right")
         table.add_column("Tokens out", justify="right")
         table.add_column("Costo USD", justify="right")
@@ -96,6 +102,7 @@ class CostTracker:
             table.add_row(
                 "[{}]{}[/{}]".format(color, display, color),
                 str(row["calls"]),
+                _format_operations(row["operations"]),
                 "{:,}".format(row["input_tokens"]),
                 "{:,}".format(row["output_tokens"]),
                 _format_cost(row["cost_usd"], is_subscription=style.get("type") == "cli"),
@@ -106,6 +113,7 @@ class CostTracker:
         table.add_row(
             "[bold]TOTAL[/bold]",
             "[bold]{}[/bold]".format(total["calls"]),
+            _format_operations(total["operations"]),
             "[bold]{:,}[/bold]".format(total["input_tokens"]),
             "[bold]{:,}[/bold]".format(total["output_tokens"]),
             "[bold]{}[/bold]".format(_format_cost(total["cost_usd"])),
@@ -162,6 +170,13 @@ def _provider_styles() -> Dict[str, Dict[str, str]]:
                 "type": entry.get("type", ""),
             }
     return styles
+
+
+def _format_operations(operations: Dict[str, int]) -> str:
+    """Formatea el desglose por operación, ej. 'generate:3 review:3 merge:3'."""
+    if not operations:
+        return "[dim]—[/dim]"
+    return " ".join("{}:{}".format(op, count) for op, count in sorted(operations.items()))
 
 
 def _format_cost(cost_usd: float, is_subscription: bool = False) -> str:

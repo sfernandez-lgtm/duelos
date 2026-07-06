@@ -10,6 +10,7 @@ from rich.table import Table
 from core.cleaner import clean_code, clean_filename, last_code_block
 from core.config import load_config, load_providers, save_config
 from core.costs import get_tracker, load_history
+from core.pipeline import run_pipeline
 from core.project import run_project
 from core.session import Session
 from ui.console import console, error, info, print_banner, success, warn
@@ -67,7 +68,7 @@ def coder_mode(config) -> None:
     provider = pick_provider(providers)
     session = Session(provider.name)
     tracker = get_tracker()
-    info("Modo Coder con [{}]{}[/{}] — comandos: /salir, /limpiar, /guardar <archivo>, /costos".format(
+    info("Modo Coder con [{}]{}[/{}] — comandos: /salir, /limpiar, /guardar <archivo>, /costos, /pro <consulta>".format(
         provider.color, provider.display_name, provider.color
     ))
 
@@ -98,6 +99,22 @@ def coder_mode(config) -> None:
                 warn("Uso: /guardar <filename>")
             else:
                 save_snippet(session, raw_filename)
+            continue
+        if user_input.startswith("/pro"):
+            query = user_input[len("/pro"):].strip()
+            if not query:
+                warn("Uso: /pro <consulta>")
+                continue
+            final = run_pipeline(providers, config, session.build_prompt(query), CODER_SYSTEM_PROMPT)
+            if final is None:
+                continue
+            session.add_turn("user", query)
+            session.add_turn("assistant", final)
+            console.print(Panel(
+                final,
+                title="[bold]⚔ PRO[/bold] · generate + review + merge",
+                border_style="cyan",
+            ))
             continue
 
         prompt = session.build_prompt(user_input)
@@ -141,7 +158,7 @@ def project_mode(config) -> None:
     if not description:
         warn("Descripción vacía; volviendo al menú")
         return
-    run_project(provider, description)
+    run_project(provider, providers, config, description)
 
 
 def show_models(config) -> None:

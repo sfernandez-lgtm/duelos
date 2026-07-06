@@ -43,5 +43,6 @@
       "price_input_per_m": 1.0,
       "price_output_per_m": 3.0
     }
-  ]
+  ],
+  "last_merger": "claude"
 }
