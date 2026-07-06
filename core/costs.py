@@ -145,15 +145,29 @@ class CostTracker:
 
 
 def load_history() -> List[Dict[str, Any]]:
-    """Lee la lista de sesiones de costs.json; lista vacía si no existe o está corrupto."""
+    """Lee la lista de sesiones de costs.json.
+
+    Si el archivo está corrupto lo renombra a costs.json.bak y arranca el
+    histórico limpio, avisando.
+    """
     if not os.path.exists(COSTS_PATH):
         return []
     try:
         with open(COSTS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, list) else []
-    except (json.JSONDecodeError, OSError):
+        if not isinstance(data, list):
+            raise ValueError("el contenido no es una lista de sesiones")
+    except (json.JSONDecodeError, ValueError, OSError) as exc:
+        from ui.console import warn
+
+        backup = COSTS_PATH + ".bak"
+        try:
+            os.replace(COSTS_PATH, backup)
+            warn("costs.json corrupto ({}); renombrado a costs.json.bak, histórico limpio".format(exc))
+        except OSError:
+            warn("costs.json corrupto ({}) y no se pudo respaldar; se ignora".format(exc))
         return []
+    return data
 
 
 def _provider_styles() -> Dict[str, Dict[str, str]]:

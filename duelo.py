@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """DUELO — orquestador de IAs de código. Entry point y menú principal."""
 
+import json
 import os
 
 from rich.panel import Panel
@@ -8,12 +9,13 @@ from rich.prompt import Prompt
 from rich.table import Table
 
 from core.cleaner import clean_code, clean_filename, last_code_block
-from core.config import load_config, load_providers, save_config
+from core.config import CONFIG_PATH, load_config, load_providers, save_config
 from core.costs import get_tracker, load_history
 from core.pipeline import run_pipeline
 from core.project import run_project
 from core.session import Session
-from ui.console import console, error, info, print_banner, success, warn
+from core.version import VERSION
+from ui.console import console, error, error_panel, info, print_banner, success, warn
 
 CODER_SYSTEM_PROMPT = (
     "Sos un desarrollador senior en sesión de pair programming. "
@@ -21,7 +23,46 @@ CODER_SYSTEM_PROMPT = (
     "Cuando entregues código, entregalo completo y funcional."
 )
 
+CODER_COMMANDS = [
+    ("/ayuda", "muestra esta lista de comandos"),
+    ("/pro <consulta>", "corre la consulta por el pipeline completo (generate + review + merge)"),
+    ("/guardar <archivo>", "guarda el último bloque de código en ~/ai-projects/snippets/"),
+    ("/costos", "resumen parcial de consumo de la sesión"),
+    ("/limpiar", "resetea el historial de la conversación"),
+    ("/salir", "cierra la sesión Coder y vuelve al menú"),
+]
+
 SNIPPETS_DIR = os.path.join(os.path.expanduser("~"), "ai-projects", "snippets")
+
+
+def provider_hint(error_message: str) -> str:
+    """Sugerencia de acción según el tipo de error del provider."""
+    message = (error_message or "").lower()
+    if "path" in message or "no encontrado" in message:
+        return "Instalá el CLI (npm install -g @anthropic-ai/claude-code) o verificá el PATH"
+    if "timeout" in message:
+        return "Reintentá; si persiste, achicá la consulta"
+    return "Reintentá; si persiste, corré el 🩺 Test de conectividad desde el menú"
+
+
+def load_config_ui():
+    """Carga config.json con manejo de faltante (regenera) y corrupto (confirma y respalda)."""
+    if not os.path.exists(CONFIG_PATH):
+        warn("config.json no encontrado; se regenera con los defaults")
+        return load_config()
+    try:
+        return load_config()
+    except (json.JSONDecodeError, ValueError) as exc:
+        error_panel(
+            "config.json está corrupto: {}".format(exc),
+            hint="Se puede regenerar con los defaults (tu versión rota queda en config.json.bak)",
+            title="Configuración",
+        )
+        if Prompt.ask("¿Regenerar config.json con los defaults?", choices=["s", "n"], default="s") != "s":
+            error("No se puede continuar sin configuración válida")
+            raise SystemExit(1)
+        os.replace(CONFIG_PATH, CONFIG_PATH + ".bak")
+        return load_config()
 
 
 def pick_provider(providers):
@@ -68,7 +109,7 @@ def coder_mode(config) -> None:
     provider = pick_provider(providers)
     session = Session(provider.name)
     tracker = get_tracker()
-    info("Modo Coder con [{}]{}[/{}] — comandos: /salir, /limpiar, /guardar <archivo>, /costos, /pro <consulta>".format(
+    info("Modo Coder con [{}]{}[/{}] — /ayuda para ver los comandos".format(
         provider.color, provider.display_name, provider.color
     ))
 
@@ -78,6 +119,10 @@ def coder_mode(config) -> None:
         if not user_input:
             continue
 
+        if user_input == "/ayuda":
+            for command, description in CODER_COMMANDS:
+                console.print("  [bold]{:<20}[/bold] [dim]{}[/dim]".format(command, description))
+            continue
         if user_input == "/salir":
             if session.turns:
                 path = session.save_log()
@@ -123,7 +168,11 @@ def coder_mode(config) -> None:
         tracker.record(provider.name, response, "coder")
 
         if not response.ok:
-            error("{}: {}".format(provider.display_name, response.error))
+            error_panel(
+                "{}: {}".format(provider.display_name, response.error),
+                hint=provider_hint(response.error),
+                title="Provider",
+            )
             continue
 
         session.add_turn("user", user_input)
@@ -266,13 +315,33 @@ def show_costs() -> None:
     console.print(table)
 
 
+def _active_provider_labels(config) -> str:
+    """Nombres (coloreados) de los providers habilitados, para banner y menú."""
+    labels = [
+        "[{}]{}[/{}]".format(e.get("color", "white"), e.get("display_name", e.get("name")), e.get("color", "white"))
+        for e in config.get("providers", []) if e.get("enabled")
+    ]
+    return " + ".join(labels) if labels else "[red]ninguno[/red]"
+
+
+def _save_tracker_if_needed() -> None:
+    tracker = get_tracker()
+    if tracker.has_data:
+        tracker.save()
+
+
 def main() -> None:
     """Loop del menú principal."""
-    print_banner()
-    config = load_config()
+    config = load_config_ui()
+    print_banner("[bold]v{}[/bold] · {}".format(VERSION, _active_provider_labels(config)))
 
     while True:
         console.print()
+        status_line = "[dim]provider:[/dim] {}".format(_active_provider_labels(config))
+        last_mode = config.get("last_project_mode")
+        if last_mode:
+            status_line += " [dim]· último proyecto: modo {}[/dim]".format(last_mode)
+        console.print(status_line)
         console.print("[bold]1[/bold] 💻 Coder")
         console.print("[bold]2[/bold] 📦 Proyecto")
         console.print("[bold]3[/bold] 💰 Costos")
@@ -281,22 +350,25 @@ def main() -> None:
         console.print("[bold]6[/bold] 🚪 Salir")
         choice = Prompt.ask("Opción", choices=["1", "2", "3", "4", "5", "6"], default="6")
 
-        if choice == "1":
-            coder_mode(config)
-        elif choice == "2":
-            project_mode(config)
-        elif choice == "3":
-            show_costs()
-        elif choice == "4":
-            show_models(config)
-        elif choice == "5":
-            run_health_checks(config)
-        else:
-            tracker = get_tracker()
-            if tracker.has_data:
-                tracker.save()
-            info("¡Hasta el próximo duelo!")
-            return
+        try:
+            if choice == "1":
+                coder_mode(config)
+            elif choice == "2":
+                project_mode(config)
+            elif choice == "3":
+                show_costs()
+            elif choice == "4":
+                show_models(config)
+            elif choice == "5":
+                run_health_checks(config)
+            else:
+                _save_tracker_if_needed()
+                info("¡Hasta el próximo duelo!")
+                return
+        except KeyboardInterrupt:
+            console.print()
+            warn("Operación cancelada (Ctrl+C); volviendo al menú")
+            _save_tracker_if_needed()
 
 
 if __name__ == "__main__":
@@ -304,4 +376,5 @@ if __name__ == "__main__":
         main()
     except (KeyboardInterrupt, EOFError):
         console.print()
-        error("Interrumpido")
+        _save_tracker_if_needed()
+        warn("Sesión interrumpida; consumo guardado")

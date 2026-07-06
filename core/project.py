@@ -10,8 +10,10 @@ from rich.prompt import Prompt
 from rich.table import Table
 
 from core.cleaner import clean_code
+from core.config import save_config
 from core.costs import get_tracker
 from core.pipeline import run_pipeline
+from core.validator import validate_file
 from providers.base import AIProvider
 from ui.console import console, error, info, success, warn
 
@@ -26,6 +28,11 @@ PLAN_SYSTEM_PROMPT = (
 GEN_SYSTEM_PROMPT = (
     "Sos un desarrollador senior. Respondés únicamente con el contenido crudo "
     "del archivo pedido, completo y funcional, sin explicaciones ni fences de markdown."
+)
+
+RETRY_ONLY_CODE = (
+    "\n\nIMPORTANTE: el intento anterior incluyó texto que no era parte del archivo "
+    "y quedó inválido. Respondé con SOLO código, sin NINGUNA línea de texto antes o después."
 )
 
 PLAN_SCHEMA = (
@@ -231,6 +238,8 @@ def run_project(provider: AIProvider, providers: List[AIProvider],
         info("Generación cancelada")
         return
     pro_mode = Prompt.ask("Modo: (r)ápido o (p)ro?", choices=["r", "p"], default="r") == "p"
+    config["last_project_mode"] = "pro" if pro_mode else "rápido"
+    save_config(config)
 
     project_dir = _unique_project_dir(plan["project_name"])
     total = len(plan["files"])
@@ -268,6 +277,27 @@ def run_project(provider: AIProvider, providers: List[AIProvider],
             continue
 
         target = _write_file(project_dir, rel_path, content)
+        result = validate_file(target)
+        if result.repaired:
+            info("{}: auto-reparado — {}".format(rel_path, result.reason))
+
+        if not result.valid:
+            warn("{}: inválido ({}); se regenera 1 vez pidiendo solo código".format(rel_path, result.reason))
+            with console.status("[{}]Regenerando {}...[/{}]".format(provider.color, rel_path, provider.color)):
+                retry = provider.generate(prompt + RETRY_ONLY_CODE, GEN_SYSTEM_PROMPT)
+            tracker.record(provider.name, retry, "generate")
+            retry_content = clean_code(retry.text) if retry.ok else ""
+            if retry_content:
+                target = _write_file(project_dir, rel_path, retry_content)
+                result = validate_file(target)
+                if result.repaired:
+                    info("{}: auto-reparado — {}".format(rel_path, result.reason))
+            if not result.valid:
+                failed.append((rel_path, "inválido: {}".format(result.reason)))
+                warn("{}: sigue inválido; queda en disco para arreglar a mano".format(rel_path))
+                continue
+
+        content = target.read_text(encoding="utf-8")  # contenido final (post reparación/reintento)
         generated.append((rel_path, content))
         written.append((rel_path, target.stat().st_size))
         success("{}/{} {}".format(i, total, rel_path))
