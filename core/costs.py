@@ -2,6 +2,7 @@
 
 import json
 import os
+import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -16,23 +17,26 @@ class CostTracker:
     def __init__(self):
         self.session_start = datetime.now().isoformat(timespec="seconds")
         self.providers: Dict[str, Dict[str, Any]] = {}
+        # record() puede llamarse desde varios threads (pipeline paralelo)
+        self._lock = threading.Lock()
 
     def record(self, provider_name: str, response: ProviderResponse, operation: str) -> None:
-        """Registra una llamada a un provider (coder, health_check, generate, ...)."""
-        stats = self.providers.setdefault(provider_name, {
-            "calls": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cost_usd": 0.0,
-            "elapsed_seconds": 0.0,
-            "operations": {},
-        })
-        stats["calls"] += 1
-        stats["input_tokens"] += response.input_tokens
-        stats["output_tokens"] += response.output_tokens
-        stats["cost_usd"] += response.cost_usd
-        stats["elapsed_seconds"] += response.elapsed_seconds
-        stats["operations"][operation] = stats["operations"].get(operation, 0) + 1
+        """Registra una llamada a un provider. Thread-safe."""
+        with self._lock:
+            stats = self.providers.setdefault(provider_name, {
+                "calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cost_usd": 0.0,
+                "elapsed_seconds": 0.0,
+                "operations": {},
+            })
+            stats["calls"] += 1
+            stats["input_tokens"] += response.input_tokens
+            stats["output_tokens"] += response.output_tokens
+            stats["cost_usd"] += response.cost_usd
+            stats["elapsed_seconds"] += response.elapsed_seconds
+            stats["operations"][operation] = stats["operations"].get(operation, 0) + 1
 
     @property
     def has_data(self) -> bool:
@@ -130,13 +134,17 @@ class CostTracker:
         if not self.has_data:
             return None
 
+        with self._lock:  # snapshot consistente aunque haya llamadas en vuelo
+            providers_snapshot = json.loads(json.dumps(self.providers))
+        total = sum(stats["cost_usd"] for stats in providers_snapshot.values())
+
         sessions = load_history()
         sessions = [s for s in sessions if s.get("session_start") != self.session_start]
         sessions.append({
             "session_start": self.session_start,
             "session_end": datetime.now().isoformat(timespec="seconds"),
-            "providers": self.providers,
-            "total_cost_usd": self.total_cost_usd(),
+            "providers": providers_snapshot,
+            "total_cost_usd": total,
         })
         with open(COSTS_PATH, "w", encoding="utf-8") as f:
             json.dump(sessions, f, indent=2, ensure_ascii=False)

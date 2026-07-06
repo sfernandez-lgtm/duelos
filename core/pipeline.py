@@ -5,15 +5,20 @@ merge en una pasada de refinamiento; la arquitectura queda lista para que en
 Etapa 2 alcance con habilitar otro provider en config.json.
 """
 
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 from core.config import save_config
 from core.costs import get_tracker
-from providers.base import AIProvider
+from providers.base import AIProvider, ProviderResponse
 from ui.console import console, error, info, warn
 
 MAX_STAGE_CHARS = 15000  # truncado de generaciones/reviews en prompts de etapas siguientes
+DEFAULT_MAX_PARALLEL = 6  # max_workers del pool; configurable con 'max_parallel' en config.json
 
 REVIEW_SYSTEM_PROMPT = (
     "Sos un revisor de código exigente y constructivo. Respondés con una crítica "
@@ -47,29 +52,89 @@ def _status(provider: AIProvider, label: str, verb: str):
     ))
 
 
+def _run_stage(jobs: List[Tuple[Any, str, Callable[[], ProviderResponse]]],
+               max_workers: int) -> Dict[Any, Any]:
+    """Corre en paralelo una lista de trabajos [(clave, descripción, callable)].
+
+    Muestra una fila de progreso viva por trabajo y devuelve {clave: ProviderResponse
+    o Exception}. Ctrl+C cancela los futures pendientes y se propaga (los que ya
+    están en vuelo terminan en background y quedan registrados en el tracker).
+    """
+    results: Dict[Any, Any] = {}
+    progress = Progress(
+        SpinnerColumn(finished_text="•"),
+        TextColumn("{task.description}"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    )
+    with progress:
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
+            futures = {}
+            rows = {}
+            for key, description, call in jobs:
+                rows[key] = progress.add_task(description, total=1)
+                futures[executor.submit(call)] = (key, description)
+            for future in as_completed(futures):
+                key, description = futures[future]
+                try:
+                    result = future.result()
+                    mark = "[green]✔[/green]" if result.ok else "[red]✖[/red]"
+                except Exception as exc:  # KeyboardInterrupt pasa de largo y cancela
+                    result, mark = exc, "[red]✖[/red]"
+                results[key] = result
+                progress.update(rows[key], description="{} {}".format(description, mark), completed=1)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+    return results
+
+
 def generate_all(providers: List[AIProvider], task_context: str,
-                 system_prompt: Optional[str] = None,
-                 label: str = "") -> Dict[str, GenerationResult]:
-    """Etapa 1: una generación por provider (secuencial; firma lista para paralelizar).
+                 system_prompt: Optional[str] = None, label: str = "",
+                 max_workers: int = DEFAULT_MAX_PARALLEL) -> Dict[str, GenerationResult]:
+    """Etapa 1: las N generaciones en paralelo (I/O bound, threads).
 
     Los providers que fallan se excluyen con un aviso; dict vacío si fallaron todos.
     """
     tracker = get_tracker()
-    generations: Dict[str, GenerationResult] = {}
-    for provider in providers:
-        with _status(provider, label, "generando"):
+    start = time.monotonic()
+
+    def make_call(provider: AIProvider) -> Callable[[], ProviderResponse]:
+        def call() -> ProviderResponse:
             response = provider.generate(task_context, system_prompt)
-        tracker.record(provider.name, response, "generate")
-        if response.ok and response.text.strip():
-            generations[provider.name] = GenerationResult(
-                provider_name=provider.name,
-                display_name=provider.display_name,
-                text=response.text.strip(),
-            )
-        else:
-            warn("{}: generación falló ({})".format(
-                provider.display_name, response.error or "respuesta vacía"
-            ))
+            tracker.record(provider.name, response, "generate")  # en el worker: queda registrado aun con Ctrl+C
+            return response
+        return call
+
+    jobs = [
+        (p.name, "[{0}]{1}{2}[/{0}] generando".format(p.color, label, p.display_name), make_call(p))
+        for p in providers
+    ]
+    results = _run_stage(jobs, max_workers)
+
+    generations: Dict[str, GenerationResult] = {}
+    sum_elapsed = 0.0
+    for provider in providers:
+        result = results.get(provider.name)
+        if isinstance(result, ProviderResponse):
+            sum_elapsed += result.elapsed_seconds
+            if result.ok and result.text.strip():
+                generations[provider.name] = GenerationResult(
+                    provider_name=provider.name,
+                    display_name=provider.display_name,
+                    text=result.text.strip(),
+                )
+            else:
+                warn("{}: generación falló ({})".format(
+                    provider.display_name, result.error or "respuesta vacía"
+                ))
+        elif result is not None:
+            warn("{}: generación falló (excepción: {})".format(provider.display_name, result))
+
+    info("{}generación: {:.1f}s en paralelo (suma de llamadas: {:.1f}s)".format(
+        label, time.monotonic() - start, sum_elapsed
+    ))
     return generations
 
 
@@ -93,33 +158,68 @@ def _review_prompt(task_context: str, generation: GenerationResult, is_self: boo
 
 def review_all(providers: List[AIProvider], task_context: str,
                generations: Dict[str, GenerationResult],
-               label: str = "") -> Dict[str, Dict[str, str]]:
-    """Etapa 2: cross-review todos-contra-todos.
+               label: str = "",
+               max_workers: int = DEFAULT_MAX_PARALLEL) -> Dict[str, Dict[str, str]]:
+    """Etapa 2: cross-review todos-contra-todos, las N*(N-1) reviews en paralelo.
 
     Cada provider revisa las generaciones de todos los otros. Con una sola
     generación disponible, el autor se revisa a sí mismo (self-review).
     Devuelve {reviewer_name: {author_name: review}}.
     """
     tracker = get_tracker()
-    reviews: Dict[str, Dict[str, str]] = {}
+    start = time.monotonic()
+
+    pairs = []
     for reviewer in providers:
         for author_name, generation in generations.items():
             is_self = reviewer.name == author_name
             if is_self and len(generations) > 1:
                 continue  # con N>1 solo se revisan entre sí
-            with _status(reviewer, label, "review de {}".format(generation.display_name)):
-                response = reviewer.generate(
-                    _review_prompt(task_context, generation, is_self),
-                    REVIEW_SYSTEM_PROMPT,
-                )
+            pairs.append((reviewer, author_name, generation, is_self))
+    if not pairs:
+        return {}
+
+    def make_call(reviewer: AIProvider, generation: GenerationResult,
+                  is_self: bool) -> Callable[[], ProviderResponse]:
+        def call() -> ProviderResponse:
+            response = reviewer.generate(
+                _review_prompt(task_context, generation, is_self),
+                REVIEW_SYSTEM_PROMPT,
+            )
             tracker.record(reviewer.name, response, "review")
-            if response.ok and response.text.strip():
-                reviews.setdefault(reviewer.name, {})[author_name] = response.text.strip()
+            return response
+        return call
+
+    jobs = []
+    for reviewer, author_name, generation, is_self in pairs:
+        description = "[{0}]{1}{2}[/{0}] review de {3}".format(
+            reviewer.color, label, reviewer.display_name, generation.display_name
+        )
+        jobs.append(((reviewer.name, author_name), description, make_call(reviewer, generation, is_self)))
+
+    results = _run_stage(jobs, max_workers)
+
+    reviews: Dict[str, Dict[str, str]] = {}
+    sum_elapsed = 0.0
+    for reviewer, author_name, generation, _ in pairs:
+        result = results.get((reviewer.name, author_name))
+        if isinstance(result, ProviderResponse):
+            sum_elapsed += result.elapsed_seconds
+            if result.ok and result.text.strip():
+                reviews.setdefault(reviewer.name, {})[author_name] = result.text.strip()
             else:
                 warn("{}: review de {} falló ({})".format(
                     reviewer.display_name, generation.display_name,
-                    response.error or "respuesta vacía"
+                    result.error or "respuesta vacía"
                 ))
+        elif result is not None:
+            warn("{}: review de {} falló (excepción: {})".format(
+                reviewer.display_name, generation.display_name, result
+            ))
+
+    info("{}reviews: {:.1f}s en paralelo (suma de llamadas: {:.1f}s)".format(
+        label, time.monotonic() - start, sum_elapsed
+    ))
     return reviews
 
 
@@ -194,12 +294,17 @@ def run_pipeline(providers: List[AIProvider], config: Dict[str, Any],
     Tolerante a fallos por etapa; aborta solo si TODAS las generaciones fallaron.
     Devuelve el texto final (sin pasar por el cleaner: eso es del caller).
     """
-    generations = generate_all(providers, task_context, system_prompt, label)
+    try:
+        max_workers = max(1, int(config.get("max_parallel", DEFAULT_MAX_PARALLEL)))
+    except (TypeError, ValueError):
+        max_workers = DEFAULT_MAX_PARALLEL
+
+    generations = generate_all(providers, task_context, system_prompt, label, max_workers)
     if not generations:
         error("{}todas las generaciones fallaron; pipeline abortado".format(label))
         return None
 
-    reviews = review_all(providers, task_context, generations, label)
+    reviews = review_all(providers, task_context, generations, label, max_workers)
     if not reviews:
         warn("{}sin reviews disponibles; el merge sigue solo con las generaciones".format(label))
 

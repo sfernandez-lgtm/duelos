@@ -11,6 +11,7 @@ from providers.openai_compat import OpenAICompatProvider
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
 
 DEFAULT_CONFIG = {
+    "max_parallel": 6,
     "providers": [
         {
             "name": "claude",

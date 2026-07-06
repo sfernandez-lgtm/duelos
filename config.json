@@ -45,6 +45,7 @@
       "price_output_per_m": 4.0
     }
   ],
-  "last_merger": "claude",
-  "last_project_mode": "pro"
+  "last_merger": "gemini",
+  "last_project_mode": "pro",
+  "max_parallel": 6
 }
