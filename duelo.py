@@ -8,9 +8,12 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
+import shutil
+
 from core.cleaner import clean_code, clean_filename, last_code_block
 from core.config import CONFIG_PATH, load_config, load_providers, save_config
 from core.costs import get_tracker, load_history
+from core.env import ENV_PATH, load_env
 from core.pipeline import run_pipeline
 from core.project import run_project
 from core.session import Session
@@ -43,6 +46,18 @@ def provider_hint(error_message: str) -> str:
     if "timeout" in message:
         return "Reintentá; si persiste, achicá la consulta"
     return "Reintentá; si persiste, corré el 🩺 Test de conectividad desde el menú"
+
+
+def ensure_env() -> None:
+    """Carga .env; si no existe lo crea desde .env.example y avisa completarlo."""
+    if not os.path.exists(ENV_PATH):
+        example = ENV_PATH + ".example"
+        if os.path.exists(example):
+            shutil.copyfile(example, ENV_PATH)
+            warn("Se creó .env desde .env.example — completá tus API keys ahí")
+        else:
+            warn(".env no existe; los providers API necesitan sus keys en el entorno")
+    load_env()
 
 
 def load_config_ui():
@@ -224,11 +239,11 @@ def show_models(config) -> None:
         for i, entry in enumerate(entries, start=1):
             color = entry.get("color", "white")
             estado = "[green]enabled[/green]" if entry.get("enabled") else "[dim]disabled[/dim]"
-            if entry.get("type") == "api":
+            if entry.get("type") == "cli":
+                key = "[dim]— (CLI)[/dim]"
+            else:
                 key_env = entry.get("api_key_env", "")
                 key = "[green]✔ {}[/green]".format(key_env) if os.environ.get(key_env) else "[red]✖ {}[/red]".format(key_env)
-            else:
-                key = "[dim]— (CLI)[/dim]"
             table.add_row(
                 str(i),
                 "[{}]{}[/{}]".format(color, entry.get("display_name", entry.get("name")), color),
@@ -332,6 +347,7 @@ def _save_tracker_if_needed() -> None:
 
 def main() -> None:
     """Loop del menú principal."""
+    ensure_env()
     config = load_config_ui()
     print_banner("[bold]v{}[/bold] · {}".format(VERSION, _active_provider_labels(config)))
 

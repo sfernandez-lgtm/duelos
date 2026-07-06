@@ -5,5 +5,9 @@ __pycache__/
 # DUELO runtime
 logs/
 costs.json
+costs.json.bak
+
+# Secrets: .env NUNCA se commitea (.env.example sí)
+.env
 
 # config.json NO se ignora: viaja con el repo

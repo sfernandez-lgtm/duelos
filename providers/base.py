@@ -14,6 +14,7 @@ class ProviderResponse:
     cost_usd: float
     elapsed_seconds: float
     error: Optional[str] = None
+    estimated: bool = False  # True si los tokens son estimados (len//4), no usage real
 
     @property
     def ok(self) -> bool:

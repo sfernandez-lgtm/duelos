@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Tuple
 
 from providers.base import AIProvider
 from providers.claude_cli import ClaudeCLIProvider
+from providers.openai_compat import OpenAICompatProvider
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
 
@@ -20,19 +21,19 @@ DEFAULT_CONFIG = {
         },
         {
             "name": "gemini",
-            "type": "api",
-            "display_name": "Gemini 3 Pro",
-            "color": "green",
-            "enabled": False,
+            "type": "openai_compat",
+            "display_name": "Gemini",
+            "color": "cyan",
+            "enabled": True,
             "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
             "api_key_env": "GEMINI_API_KEY",
-            "model": "gemini-3-pro",
-            "price_input_per_m": 2.0,
-            "price_output_per_m": 12.0,
+            "model": "gemini-2.5-pro",
+            "price_input_per_m": 1.25,
+            "price_output_per_m": 10.0,
         },
         {
             "name": "glm",
-            "type": "api",
+            "type": "openai_compat",
             "display_name": "GLM-5.2",
             "color": "red",
             "enabled": False,
@@ -44,7 +45,7 @@ DEFAULT_CONFIG = {
         },
         {
             "name": "kimi",
-            "type": "api",
+            "type": "openai_compat",
             "display_name": "Kimi K2.6",
             "color": "magenta",
             "enabled": False,
@@ -92,6 +93,30 @@ def load_providers(config: Dict[str, Any]) -> Tuple[List[AIProvider], List[str]]
                 ClaudeCLIProvider(
                     display_name=entry.get("display_name"),
                     color=entry.get("color"),
+                )
+            )
+        elif ptype == "openai_compat":
+            display = entry.get("display_name", entry.get("name"))
+            key_env = entry.get("api_key_env", "")
+            if not key_env or not os.environ.get(key_env):
+                warnings.append(
+                    "{}: {} no seteada — agregala a .env; provider deshabilitado".format(
+                        display, key_env or "api_key_env"
+                    )
+                )
+                continue
+            providers.append(
+                OpenAICompatProvider(
+                    name=entry.get("name"),
+                    base_url=entry.get("base_url", ""),
+                    api_key_env=key_env,
+                    model=entry.get("model", ""),
+                    display_name=display,
+                    color=entry.get("color"),
+                    pricing={
+                        "input_per_1m": entry.get("price_input_per_m", 0.0),
+                        "output_per_1m": entry.get("price_output_per_m", 0.0),
+                    },
                 )
             )
         elif ptype == "api":

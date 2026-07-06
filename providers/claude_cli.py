@@ -70,6 +70,7 @@ class ClaudeCLIProvider(AIProvider):
             output_tokens=len(text) // 4,
             cost_usd=0.0,  # cubierto por suscripción Max
             elapsed_seconds=elapsed,
+            estimated=True,  # el CLI no reporta usage
         )
 
     @staticmethod
