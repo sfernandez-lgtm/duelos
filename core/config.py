@@ -14,6 +14,8 @@ DEFAULT_CONFIG = {
     "max_parallel": 6,
     "director": "claude",
     "max_fix_iterations": 2,
+    "repo_context_chars": 12000,
+    "max_repo_files": 8,
     "providers": [
         {
             "name": "claude",

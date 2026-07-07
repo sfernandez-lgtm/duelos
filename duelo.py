@@ -17,6 +17,7 @@ from core.director import run_director
 from core.env import ENV_PATH, load_env
 from core.pipeline import run_pipeline
 from core.project import run_project
+from core.repo import load_repo, run_repo_task, show_repo_map
 from core.session import Session
 from core.version import VERSION
 from ui.console import console, error, error_panel, info, print_banner, success, warn
@@ -254,6 +255,31 @@ def director_mode(config) -> None:
     run_director(providers, config, request)
 
 
+def repo_mode(config) -> None:
+    """Modo Repo: carga un repo existente y aplica una tarea sobre sus archivos."""
+    providers, warnings = load_providers(config)
+    for message in warnings:
+        warn(message)
+    if not providers:
+        warn("No hay providers habilitados; activá alguno en 🤖 Modelos")
+        return
+
+    source = Prompt.ask("[bold green]Repo (URL git o path local)[/bold green]").strip()
+    if not source:
+        warn("Sin repo; volviendo al menú")
+        return
+    ctx = load_repo(source)
+    if ctx is None:
+        return
+    show_repo_map(ctx)
+
+    task = _read_multiline("Describí la tarea a aplicar sobre el repo (terminá con una línea vacía o /fin)")
+    if not task:
+        warn("Tarea vacía; volviendo al menú")
+        return
+    run_repo_task(providers, config, ctx, task)
+
+
 def show_models(config) -> None:
     """Lista los providers configurados y permite togglear enabled."""
     while True:
@@ -390,11 +416,12 @@ def main() -> None:
         console.print("[bold]1[/bold] 💻 Coder")
         console.print("[bold]2[/bold] 📦 Proyecto")
         console.print("[bold]3[/bold] 🎬 Director")
-        console.print("[bold]4[/bold] 💰 Costos")
-        console.print("[bold]5[/bold] 🤖 Modelos")
-        console.print("[bold]6[/bold] 🩺 Test de conectividad")
-        console.print("[bold]7[/bold] 🚪 Salir")
-        choice = Prompt.ask("Opción", choices=["1", "2", "3", "4", "5", "6", "7"], default="7")
+        console.print("[bold]4[/bold] 🔧 Repo")
+        console.print("[bold]5[/bold] 💰 Costos")
+        console.print("[bold]6[/bold] 🤖 Modelos")
+        console.print("[bold]7[/bold] 🩺 Test de conectividad")
+        console.print("[bold]8[/bold] 🚪 Salir")
+        choice = Prompt.ask("Opción", choices=["1", "2", "3", "4", "5", "6", "7", "8"], default="8")
 
         try:
             if choice == "1":
@@ -404,10 +431,12 @@ def main() -> None:
             elif choice == "3":
                 director_mode(config)
             elif choice == "4":
-                show_costs()
+                repo_mode(config)
             elif choice == "5":
-                show_models(config)
+                show_costs()
             elif choice == "6":
+                show_models(config)
+            elif choice == "7":
                 run_health_checks(config)
             else:
                 _save_tracker_if_needed()
