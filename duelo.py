@@ -14,6 +14,7 @@ from core.cleaner import clean_code, clean_filename, last_code_block
 from core.config import CONFIG_PATH, load_config, load_providers, save_config
 from core.costs import get_tracker, load_history
 from core.director import run_director
+from core.director_repo import run_director_repo
 from core.env import ENV_PATH, load_env
 from core.pipeline import run_pipeline
 from core.project import run_project
@@ -240,12 +241,29 @@ def _read_multiline(header: str):
 
 
 def director_mode(config) -> None:
-    """Pide el pedido grande y corre el flujo del Director (core/director.py)."""
+    """Pide el pedido grande y corre el Director: proyecto nuevo o sobre repo existente."""
     providers, warnings = load_providers(config)
     for message in warnings:
         warn(message)
     if not providers:
         warn("No hay providers habilitados; activá alguno en 🤖 Modelos")
+        return
+
+    kind = Prompt.ask("¿(n)uevo proyecto o sobre (r)epo existente?", choices=["n", "r"], default="n")
+    if kind == "r":
+        source = Prompt.ask("[bold green]Repo (URL git o path local)[/bold green]").strip()
+        if not source:
+            warn("Sin repo; volviendo al menú")
+            return
+        ctx = load_repo(source)
+        if ctx is None:
+            return
+        show_repo_map(ctx)
+        request = _read_multiline("Describí el pedido grande a dirigir sobre el repo (terminá con una línea vacía o /fin)")
+        if not request:
+            warn("Pedido vacío; volviendo al menú")
+            return
+        run_director_repo(providers, config, ctx, request)
         return
 
     request = _read_multiline("Describí el pedido grande a dirigir (terminá con una línea vacía o /fin)")

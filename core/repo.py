@@ -5,7 +5,10 @@ director selecciona los archivos relevantes para la tarea, y la modificación
 se aplica en una rama nueva (o con backups .duelo-backup en modo sin-git)
 con la disciplina de siempre: cleaner + validator + auto-reparación +
 1 reintento estricto. Si el repo tiene tests, se corren antes y después
-como línea base de comparación (el loop de corrección llega en 7.2).
+como línea base de comparación; si los cambios rompen tests que pasaban
+en la línea base, un loop de corrección (max_fix_iterations) regenera los
+archivos implicados con el output de los tests rotos + el diff como
+feedback. Nada se descarta ni commitea automáticamente jamás.
 """
 
 import json
@@ -26,6 +29,7 @@ from rich.table import Table
 from core.cleaner import clean_code
 from core.costs import get_tracker
 from core.director import get_director
+from core.evaluator import _implicated_by_tests
 from core.pipeline import run_pipeline
 from core.project import GEN_SYSTEM_PROMPT, RETRY_ONLY_CODE, _kebab_case, _safe_relpath, _write_file
 from core.validator import validate_file
@@ -40,6 +44,7 @@ TESTS_TIMEOUT_SECONDS = 300
 CLONE_TIMEOUT_SECONDS = 600
 GIT_TIMEOUT_SECONDS = 120
 BACKUP_SUFFIX = ".duelo-backup"
+MAX_FEEDBACK_CHARS = 4000              # truncado de output de tests y diff en el feedback
 README_MAX_CHARS = 2000                # truncado del README en el resumen
 KEY_FILE_LINES = 30                    # primeras líneas de archivos clave en el resumen
 KEY_FILES = ("pyproject.toml", "setup.py", "package.json", "requirements.txt",
@@ -608,6 +613,83 @@ def tests_summary(tests: Optional[Dict[str, Any]]) -> str:
     return "exit {}".format(tests["returncode"])
 
 
+# pytest -q: "FAILED test_x.py::TestX::test_y - ..." / unittest: "FAIL: test_y (mod.TestX...)"
+# el id no puede empezar con '(' para no confundir el resumen "FAILED (failures=1)" de unittest
+FAILED_PYTEST_RE = re.compile(r"^(?:FAILED|ERROR) +([^\s(]\S*)", re.MULTILINE)
+FAILED_UNITTEST_RE = re.compile(r"^(?:FAIL|ERROR): +(\S+(?: \([^)]*\))?)", re.MULTILINE)
+
+
+def failing_test_ids(tests: Optional[Dict[str, Any]]) -> List[str]:
+    """Identificadores de los tests que fallaron, parseados del output."""
+    if tests is None:
+        return []
+    output = tests["output"]
+    ids = FAILED_PYTEST_RE.findall(output) or FAILED_UNITTEST_RE.findall(output)
+    seen: List[str] = []
+    for test_id in ids:
+        if test_id not in seen:
+            seen.append(test_id)
+    return seen
+
+
+def _fail_count(tests: Optional[Dict[str, Any]]) -> int:
+    """Cantidad de fallos+errores según el resumen del runner (0 si no se parsea)."""
+    if tests is None:
+        return 0
+    total = 0
+    for pattern in (r"(\d+) failed", r"(\d+) error", r"failures=(\d+)", r"errors=(\d+)"):
+        match = re.search(pattern, tests["output"])
+        if match:
+            total += int(match.group(1))
+    return total
+
+
+def new_failures(baseline: Optional[Dict[str, Any]], after: Optional[Dict[str, Any]]) -> List[str]:
+    """Tests que fallan ahora y NO fallaban en la línea base.
+
+    La comparación es contra la línea base, no contra cero fallos: lo que ya
+    estaba roto antes no cuenta como roto por DUELO. Lista vacía = sin
+    roturas nuevas. Si el output no se puede parsear, degrada a comparar
+    returncode y conteos de fallos.
+    """
+    if after is None or after["returncode"] == 0:
+        return []
+    base_ids = set(failing_test_ids(baseline))
+    after_ids = failing_test_ids(after)
+    if after_ids:
+        return [t for t in after_ids if t not in base_ids]
+    base_rc = baseline["returncode"] if baseline is not None else 0
+    if base_rc == 0:
+        return ["(tests fallando, detalle no parseable: exit {})".format(after["returncode"])]
+    base_count, after_count = _fail_count(baseline), _fail_count(after)
+    if after_count > base_count:
+        return ["(aumentaron los fallos: {} -> {})".format(base_count, after_count)]
+    return []
+
+
+def _failing_test_files(root: Path, ids: List[str]) -> List[str]:
+    """Paths (relativos) de los archivos de test detrás de los ids de fallos."""
+    files: List[str] = []
+    for test_id in ids:
+        path = None
+        if "::" in test_id:  # pytest: path/test_x.py::TestX::test_y
+            candidate = test_id.split("::")[0].replace("\\", "/")
+            if (root / candidate).is_file():
+                path = candidate
+        else:  # unittest: test_y (mod.sub.TestX) -> probar mod/sub.py, mod.py...
+            match = re.search(r"\(([\w.]+)\)", test_id)
+            if match:
+                parts = match.group(1).split(".")
+                for k in range(len(parts), 0, -1):
+                    candidate = "/".join(parts[:k]) + ".py"
+                    if (root / candidate).is_file():
+                        path = candidate
+                        break
+        if path and path not in files:
+            files.append(path)
+    return files
+
+
 # ------------------------------------------------------------------ ejecución
 
 def _unique_branch(root: Path, base: str) -> str:
@@ -699,9 +781,86 @@ def _generate_repo_file(director: AIProvider, providers: List[AIProvider],
     return target, ""
 
 
+def _fix_feedback_block(attempt: int, broken: List[str], after: Dict[str, Any],
+                        diff_text: str, rel_path: str) -> str:
+    """Bloque de corrección que se suma al prompt base del archivo."""
+    parts = [
+        "CORRECCIÓN REQUERIDA (intento {}): los cambios aplicados rompieron tests "
+        "que pasaban en la línea base.".format(attempt),
+        "Tests rotos (nuevos respecto de la línea base):\n" + "\n".join("- " + b for b in broken),
+        "OUTPUT DE LOS TESTS:\n" + after["output"][-MAX_FEEDBACK_CHARS:],
+    ]
+    if diff_text.strip():
+        parts.append("DIFF DE LO CAMBIADO HASTA AHORA:\n" + diff_text[:MAX_FEEDBACK_CHARS])
+    parts.append(
+        "Generá la versión corregida COMPLETA del archivo '{}': arreglá la causa de "
+        "los tests rotos sin abandonar la tarea pedida ni romper lo que ya "
+        "funcionaba.".format(rel_path)
+    )
+    return "\n\n" + "\n\n".join(parts)
+
+
+def _run_correction_loop(director: AIProvider, providers: List[AIProvider],
+                         config: Dict[str, Any], ctx: RepoContext, summary: str,
+                         task: str, selection: Dict[str, Any], written: List[str],
+                         pro_mode: bool, baseline: Optional[Dict[str, Any]],
+                         after: Optional[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], List[str], int]:
+    """Mientras haya tests rotos vs la línea base, regenera los archivos implicados.
+
+    Devuelve (última corrida de tests, tests que siguen rotos, intentos usados).
+    """
+    broken = new_failures(baseline, after)
+    if after is not None and after["returncode"] != 0 and not broken:
+        info("Los fallos de tests ya estaban en la línea base; no se consideran rotos por DUELO")
+    if not broken or not written:
+        return after, broken, 0
+
+    try:
+        max_fix = max(0, int(config.get("max_fix_iterations", 2)))
+    except (TypeError, ValueError):
+        max_fix = 2
+
+    attempt = 0
+    while broken and attempt < max_fix:
+        attempt += 1
+        console.rule("[bold yellow]🔧 corrección {}/{}: {} test(s) roto(s) vs línea base[/bold yellow]".format(
+            attempt, max_fix, len(broken)
+        ))
+        fail_files = _failing_test_files(ctx.root, broken)
+        targets = _implicated_by_tests(ctx.root, fail_files, written) if fail_files else []
+        targets = targets or list(written)  # si no se puede determinar: todos los tocados
+        diff_text = _git(ctx.root, "diff").stdout if ctx.is_git else ""
+
+        current: List[Tuple[str, str]] = []
+        for rel_path in selection["relevant_files"] + selection["files_to_create"]:
+            try:
+                current.append((rel_path, (ctx.root / rel_path).read_text(encoding="utf-8", errors="replace")))
+            except OSError:
+                pass
+
+        for rel_path in targets:
+            label = "[fix {} · {}] ".format(attempt, rel_path)
+            prompt = _repo_file_prompt(summary, task, current, rel_path, True) \
+                + _fix_feedback_block(attempt, broken, after, diff_text, rel_path)
+            target, fail_reason = _generate_repo_file(
+                director, providers, config, ctx.root, prompt, rel_path, pro_mode, label
+            )
+            if target is None:
+                error("{}: la corrección falló ({})".format(rel_path, fail_reason))
+
+        after = run_repo_tests(ctx.root, "corrección {}".format(attempt))
+        broken = new_failures(baseline, after)
+
+    if not broken:
+        success("Corrección cerrada: sin tests rotos respecto de la línea base")
+    return after, broken, attempt
+
+
 def _show_final_report(ctx: RepoContext, branch: Optional[str], previous_branch: Optional[str],
                        written: List[str], failed: List[Tuple[str, str]],
-                       baseline: Optional[Dict[str, Any]], after: Optional[Dict[str, Any]]) -> None:
+                       baseline: Optional[Dict[str, Any]], after: Optional[Dict[str, Any]],
+                       broken: Optional[List[str]] = None, fix_attempts: int = 0) -> None:
+    broken = broken or []
     if ctx.is_git:
         status = _git(ctx.root, "status", "--short").stdout.rstrip()
         diffstat = _git(ctx.root, "diff", "--stat").stdout.rstrip()
@@ -712,13 +871,15 @@ def _show_final_report(ctx: RepoContext, branch: Optional[str], previous_branch:
 
     if baseline is not None or after is not None:
         info("Tests — antes: {} · después: {}".format(tests_summary(baseline), tests_summary(after)))
-        if baseline is not None and after is not None:
-            if after["returncode"] == 0:
-                success("Los tests siguen en verde")
-            elif baseline["returncode"] == 0:
-                warn("Los cambios ROMPIERON tests que antes pasaban (el loop de corrección llega en 7.2)")
+        if after is not None:
+            if broken:
+                warn("Quedaron tests rotos tras {} corrección(es): {}".format(
+                    fix_attempts, ", ".join(broken)
+                ))
+            elif after["returncode"] == 0:
+                success("Los tests están en verde")
             else:
-                warn("Los tests ya fallaban en la línea base; revisá si son los mismos fallos")
+                warn("Persisten fallos que ya estaban en la línea base (no los causó DUELO)")
 
     lines = []
     if branch:
@@ -735,6 +896,12 @@ def _show_final_report(ctx: RepoContext, branch: Optional[str], previous_branch:
         lines.append("[dim]Para ver el diff completo: cd {} && git diff[/dim]".format(ctx.root))
         if previous_branch and previous_branch != "?":
             lines.append("[dim]Para volver a tu rama: git checkout {}[/dim]".format(previous_branch))
+            if broken and branch:
+                lines.append("[dim]Para descartar el intento entero: git checkout {} && git branch -D {}[/dim]".format(
+                    previous_branch, branch
+                ))
+    elif broken:
+        lines.append("[dim]Para descartar: restaurá los originales desde sus copias {}[/dim]".format(BACKUP_SUFFIX))
     console.print(Panel("\n".join(lines), title="🔧 Resultado del modo Repo", border_style="green" if written else "red"))
 
 
@@ -827,7 +994,11 @@ def run_repo_task(providers: List[AIProvider], config: Dict[str, Any],
         success("{}/{} {} escrito ({:,} B)".format(i, len(targets), rel_path, target.stat().st_size))
 
     after = run_repo_tests(ctx.root, "post-cambios") if ctx.has_tests and written else None
+    after, broken, fix_attempts = _run_correction_loop(
+        director, providers, config, ctx, summary, task, selection,
+        written, pro_mode, baseline, after
+    )
 
-    _show_final_report(ctx, branch, previous_branch, written, failed, baseline, after)
+    _show_final_report(ctx, branch, previous_branch, written, failed, baseline, after, broken, fix_attempts)
     tracker.render_summary(console)
     tracker.save()
